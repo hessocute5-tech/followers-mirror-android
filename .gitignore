@@ -1,0 +1,97 @@
+# Gradle and Android build outputs/caches
+.gradle/
+**/.gradle/
+.kotlin/
+**/.kotlin/
+build/
+**/build/
+out/
+**/out/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Generated Android packages and compiler artifacts
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.hprof
+*.log
+
+# Local machine configuration and Android SDK locations
+local.properties
+**/local.properties
+.android/
+.sdk/
+android-sdk/
+android-sdk-*/
+sdk-path.txt
+
+# IDE state
+.idea/
+*.iml
+.vscode/
+
+# Signing material and credentials
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+keystore.properties
+signing.properties
+signingConfig.properties
+key.properties
+credentials.properties
+secrets.properties
+*.secret
+.env
+.env.*
+
+# Instagram exports and private follower data
+followers*.json
+following*.json
+followers*.csv
+following*.csv
+followers*.txt
+following*.txt
+follower-data.*
+following-data.*
+**/Instagram Data/
+**/instagram-export*/
+**/instagram_export*/
+**/instagram-data/
+**/instagram_data/
+**/connections/followers_and_following/
+*.instagram-export.zip
+instagram-export*.zip
+instagram_export*.zip
+instagram*.zip
+Instagram*.zip
+**/follower-snapshots*/
+**/instagram-snapshots*/
+
+# These are synthetic, privacy-safe parser/comparison fixtures.
+!app/src/test/resources/instagram/followers_*.json
+!app/src/test/resources/instagram/following.json
+
+# Private backups and temporary/editor files
+backup/
+backups/
+.backups/
+**/private-backup*/
+**/private-backups*/
+*.bak
+*.backup
+*.old
+*.orig
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+Thumbs.db
+.DS_Store
