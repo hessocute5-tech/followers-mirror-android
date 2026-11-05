@@ -25,6 +25,11 @@ import java.util.Locale
 internal fun ReviewManagerScreen(
     state: ReviewState,
     statusMessage: String,
+    recovery: RecoveryNotice?,
+    onExportRecovery: () -> Unit,
+    onRestoreBackup: () -> Unit,
+    onDiscardRecovery: () -> Unit,
+    onRetryLoad: () -> Unit,
     onOpenProfile: (String) -> Unit,
     onChangeStatus: (Collection<String>, ReviewStatus) -> Unit,
     onConfirmManual: (Collection<String>) -> Unit,
@@ -67,6 +72,21 @@ internal fun ReviewManagerScreen(
             }
         }
         Spacer(Modifier.height(8.dp))
+        recovery?.let { issue ->
+            Column(Modifier.fillMaxWidth().background(colors.errorContainer, RoundedCornerShape(10.dp)).padding(10.dp)) {
+                Text("RECOVERY REQUIRED", color = colors.onErrorContainer, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                Spacer(Modifier.height(4.dp))
+                Text(issue.message, color = colors.onErrorContainer, fontSize = 11.sp, lineHeight = 15.sp)
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (issue.raw != null) {
+                        TextButton(onClick = onExportRecovery) { Text("EXPORT ORIGINAL", fontSize = 9.sp) }
+                        TextButton(onClick = onRestoreBackup) { Text("RESTORE BACKUP", fontSize = 9.sp) }
+                        TextButton(onClick = onDiscardRecovery) { Text("PRESERVE & CLEAR", fontSize = 9.sp) }
+                    } else TextButton(onClick = onRetryLoad) { Text("RETRY", fontSize = 9.sp) }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
         ReviewSearch(query = query, onQueryChange = { query = it })
         Spacer(Modifier.height(6.dp))
 

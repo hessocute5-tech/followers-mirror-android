@@ -1,6 +1,7 @@
 package com.lgiii.followermirror
 
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.util.Locale
 
@@ -57,10 +58,81 @@ internal data class ReviewResult(
 internal interface ReviewStringStore {
     fun read(): String?
     fun write(value: String): Boolean
+    fun preserve(value: String): Boolean
+}
+
+internal sealed interface ReviewLoadResult {
+    data object Missing : ReviewLoadResult
+    data class Loaded(val state: ReviewState) : ReviewLoadResult
+    data class RecoveryRequired(val raw: String, val reason: String) : ReviewLoadResult
+    data class Unavailable(val reason: String) : ReviewLoadResult
 }
 
 internal class ReviewManagerRepository(private val store: ReviewStringStore) {
-    fun load(): ReviewState = runCatching { decode(store.read()) }.getOrDefault(ReviewState())
+    private var blockedRaw: String? = null
+    private var blocked = false
+
+    fun load(): ReviewLoadResult {
+        val raw = try {
+            store.read()
+        } catch (e: UnreadableStoredValue) {
+            blocked = true
+            blockedRaw = e.recoveryCopy
+            return ReviewLoadResult.RecoveryRequired(e.recoveryCopy, e.message ?: "Review data was stored in an incompatible form and needs recovery.")
+        } catch (_: Exception) {
+            blocked = true
+            blockedRaw = null
+            return ReviewLoadResult.Unavailable("Review data could not be read. Changes are paused until recovery.")
+        }
+        if (raw == null) {
+            blocked = false
+            blockedRaw = null
+            return ReviewLoadResult.Missing
+        }
+        return try {
+            val state = decode(raw)
+            blocked = false
+            blockedRaw = null
+            ReviewLoadResult.Loaded(state)
+        } catch (_: Exception) {
+            blocked = true
+            blockedRaw = raw
+            ReviewLoadResult.RecoveryRequired(raw, "Saved Review Manager data could not be read. It is preserved; export or restore a backup before replacing it.")
+        }
+    }
+
+    fun restore(raw: String): ReviewResult {
+        val restored = try { decode(raw) } catch (_: Exception) {
+            return failure(ReviewState(), "That backup is incomplete or invalid. Review Manager data was left unchanged.")
+        }
+        val original = blockedRaw
+        if (blocked && original == null) return failure(ReviewState(), "Could not preserve the unreadable original data. Nothing was replaced.")
+        if (original != null && !runCatching { store.preserve(original) }.getOrDefault(false)) {
+            return failure(ReviewState(), "Could not preserve the unreadable original data. Nothing was replaced.")
+        }
+        if (!runCatching { store.write(raw) }.getOrDefault(false)) {
+            return failure(ReviewState(), "Could not restore the backup. The original data was left unchanged.")
+        }
+        blocked = false
+        blockedRaw = null
+        return ReviewResult(true, "Review Manager backup restored.", restored)
+    }
+
+    fun discardUnreadable(): ReviewResult {
+        if (!blocked) return failure(ReviewState(), "No unreadable Review Manager data needs recovery.")
+        val original = blockedRaw
+        if (original == null) return failure(ReviewState(), "Could not preserve the unreadable original data. Nothing was discarded.")
+        if (!runCatching { store.preserve(original) }.getOrDefault(false)) {
+            return failure(ReviewState(), "Could not preserve the unreadable original data. Nothing was discarded.")
+        }
+        val empty = encode(ReviewState())
+        if (!runCatching { store.write(empty) }.getOrDefault(false)) {
+            return failure(ReviewState(), "Could not clear Review Manager data. The original data was left unchanged.")
+        }
+        blocked = false
+        blockedRaw = null
+        return ReviewResult(true, "Unreadable review data was preserved in a local recovery copy and cleared from active Review Manager.", ReviewState())
+    }
 
     fun addToQueue(current: ReviewState, usernames: Collection<String>, at: Long): ReviewResult {
         val normalized = normalizeInputs(usernames) ?: return failure(current, "Enter valid Instagram usernames.")
@@ -162,9 +234,11 @@ internal class ReviewManagerRepository(private val store: ReviewStringStore) {
     fun clearAll(current: ReviewState): ReviewResult =
         persist(current, ReviewState(), "Review queue, protected accounts, and review history cleared.")
 
-    private fun persist(old: ReviewState, next: ReviewState, success: String): ReviewResult =
-        if (runCatching { store.write(encode(next)) }.getOrDefault(false)) ReviewResult(true, success, next)
+    private fun persist(old: ReviewState, next: ReviewState, success: String): ReviewResult {
+        if (blocked) return failure(old, "Review changes are paused until the unreadable saved data is recovered.")
+        return if (runCatching { store.write(encode(next)) }.getOrDefault(false)) ReviewResult(true, success, next)
         else ReviewResult(false, "Could not save review data. No changes were applied.", old)
+    }
 
     private fun failure(state: ReviewState, message: String) = ReviewResult(false, message, state)
 
@@ -207,50 +281,87 @@ internal class ReviewManagerRepository(private val store: ReviewStringStore) {
             .toString()
     }
 
-    private fun decode(raw: String?): ReviewState {
-        if (raw.isNullOrBlank()) return ReviewState()
+    private fun decode(raw: String): ReviewState {
         val root = JSONObject(raw)
+        if (root.has("version")) {
+            val version = root.opt("version") as? Number ?: throw JSONException("The saved Review Manager version is invalid.")
+            if (version.toInt() != 1 || version.toDouble() != 1.0) throw JSONException("This Review Manager data version is not supported.")
+        } // A missing version is the original v1 representation and remains supported.
+        val queueArray = root.opt("queue") as? JSONArray ?: throw JSONException("The saved review queue is missing or invalid.")
+        val protectedArray = root.opt("protected") as? JSONArray ?: throw JSONException("The saved protected account list is missing or invalid.")
+        val historyArray = root.opt("history") as? JSONArray ?: throw JSONException("The saved review history is missing or invalid.")
         val queue = linkedMapOf<String, ReviewEntry>()
-        val queueArray = root.optJSONArray("queue") ?: JSONArray()
         for (index in 0 until queueArray.length()) {
-            val item = queueArray.getJSONObject(index)
-            val username = normalizeUsername(item.getString("username"))
-            if (!username.matches(USERNAME)) continue
+            val item = queueArray.opt(index) as? JSONObject ?: throw JSONException("A saved review queue record is incomplete.")
+            val rawUsername = item.opt("username") as? String ?: throw JSONException("A saved review record has no valid username.")
+            val username = normalizeUsername(rawUsername)
+            if (!username.matches(USERNAME)) throw JSONException("A saved review record has an incomplete username.")
+            val addedAt = optionalLong(item, "addedAt", 0L)
+            val statusValue = optionalString(item, "status", ReviewStatus.AWAITING_REVIEW.name)
+            val notes = optionalString(item, "notes", "")
+            if (queue.containsKey(username)) throw JSONException("The saved review queue contains duplicate usernames.")
             queue[username] = ReviewEntry(
                 username = username,
-                addedAt = item.optLong("addedAt"),
-                status = ReviewStatus.valueOf(item.optString("status", ReviewStatus.AWAITING_REVIEW.name)),
-                notes = item.optString("notes"),
+                addedAt = addedAt,
+                status = enumValueOrError(statusValue, "review status"),
+                notes = notes,
             )
         }
-        val protectedArray = root.optJSONArray("protected") ?: JSONArray()
         val protected = buildSet {
             for (index in 0 until protectedArray.length()) {
-                normalizeUsername(protectedArray.optString(index)).takeIf { it.matches(USERNAME) }?.let(::add)
+                val rawUsername = protectedArray.opt(index) as? String ?: throw JSONException("A protected account record is invalid.")
+                val username = normalizeUsername(rawUsername)
+                if (!username.matches(USERNAME)) throw JSONException("A protected account record is incomplete.")
+                add(username)
             }
         }
-        val historyArray = root.optJSONArray("history") ?: JSONArray()
         val history = buildList {
             for (index in 0 until historyArray.length()) {
-                val item = historyArray.optJSONObject(index) ?: continue
-                val username = normalizeUsername(item.optString("username"))
-                if (!username.matches(USERNAME)) continue
+                val item = historyArray.opt(index) as? JSONObject ?: throw JSONException("A saved review history record is incomplete.")
+                val rawUsername = item.opt("username") as? String ?: throw JSONException("A saved history record has no valid username.")
+                val username = normalizeUsername(rawUsername)
+                if (!username.matches(USERNAME)) throw JSONException("A saved history record has an incomplete username.")
+                val occurredAt = optionalLong(item, "occurredAt", 0L)
+                val event = enumValueOrError<ReviewEvent>(optionalString(item, "event", ReviewEvent.STATUS_CHANGED.name), "review event")
+                val scope = enumValueOrError<ReviewScope>(optionalString(item, "scope", ReviewScope.INDIVIDUAL.name), "review scope")
+                val manualCompletion = optionalBoolean(item, "manualCompletion", false)
                 add(ReviewHistoryEntry(
                     username = username,
-                    previousStatus = item.optString("previousStatus").toNullableEnum<ReviewStatus>(),
-                    newStatus = item.optString("newStatus").toNullableEnum<ReviewStatus>(),
-                    occurredAt = item.optLong("occurredAt"),
-                    event = runCatching { ReviewEvent.valueOf(item.optString("event")) }.getOrDefault(ReviewEvent.STATUS_CHANGED),
-                    scope = runCatching { ReviewScope.valueOf(item.optString("scope")) }.getOrDefault(ReviewScope.INDIVIDUAL),
-                    manualCompletion = item.optBoolean("manualCompletion"),
+                    previousStatus = nullableStatus(item, "previousStatus"),
+                    newStatus = nullableStatus(item, "newStatus"),
+                    occurredAt = occurredAt,
+                    event = event,
+                    scope = scope,
+                    manualCompletion = manualCompletion,
                 ))
             }
         }
         return ReviewState(queue, protected, history.take(MAX_HISTORY))
     }
 
-    private inline fun <reified T : Enum<T>> String.toNullableEnum(): T? =
-        takeUnless { it.isBlank() || it == "null" }?.let { runCatching { enumValueOf<T>(it) }.getOrNull() }
+    private inline fun <reified T : Enum<T>> enumValueOrError(value: String, field: String): T =
+        runCatching { enumValueOf<T>(value) }.getOrElse { throw JSONException("The saved $field is not supported.") }
+
+    private fun nullableStatus(item: JSONObject, key: String): ReviewStatus? {
+        if (!item.has(key) || item.isNull(key)) return null
+        val value = item.opt(key) as? String ?: throw JSONException("A saved status field has an invalid type.")
+        if (value == "null" || value.isBlank()) return null
+        return enumValueOrError<ReviewStatus>(value, key)
+    }
+
+    private fun optionalString(item: JSONObject, key: String, default: String): String =
+        if (!item.has(key)) default else item.opt(key) as? String ?: throw JSONException("A saved $key field has an invalid type.")
+
+    private fun optionalLong(item: JSONObject, key: String, default: Long): Long {
+        if (!item.has(key)) return default
+        val value = item.opt(key) as? Number ?: throw JSONException("A saved $key field has an invalid type.")
+        val longValue = value.toLong()
+        if (value.toDouble() != longValue.toDouble() || longValue < 0L) throw JSONException("A saved $key field is invalid.")
+        return longValue
+    }
+
+    private fun optionalBoolean(item: JSONObject, key: String, default: Boolean): Boolean =
+        if (!item.has(key)) default else item.opt(key) as? Boolean ?: throw JSONException("A saved $key field has an invalid type.")
 
     private companion object {
         const val MAX_HISTORY = 2_000

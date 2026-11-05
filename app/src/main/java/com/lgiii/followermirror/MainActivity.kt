@@ -61,18 +61,16 @@ import java.util.Locale
 private const val DATASET_STORE = "imported_datasets_v1"
 private const val THEME_MODE_PREF = "theme_mode"
 private const val REVIEW_MANAGER_STORE = "review_manager_v1"
+private const val DATASET_RECOVERY_PREFIX = "recovery_dataset_raw_"
+private const val SNAPSHOT_RECOVERY_PREFIX = "recovery_snapshots_raw_"
+private const val REVIEW_RECOVERY_PREFIX = "recovery_review_raw_"
 
 private fun isErrorStatus(message: String): Boolean =
-    listOf("Import failed", "Save failed", "Delete failed", "Reset failed").any(message::startsWith)
-
-private data class SavedDataset(
-    val accounts: Set<String>,
-    val importedAt: Long?,
-    val sourceFiles: List<String>,
-    val validated: Boolean,
-)
+    listOf("Import failed", "Save failed", "Delete failed", "Reset failed", "Saved", "Could not", "Dataset changes are paused").any(message::startsWith)
 
 private enum class DataAction { DELETE_FOLLOWERS, DELETE_FOLLOWING, RESET_ALL }
+private enum class RecoveryTarget { DATASETS, SNAPSHOTS, REVIEW }
+internal data class RecoveryNotice(val raw: String?, val message: String)
 
 class MainActivity : ComponentActivity() {
     private val prefs by lazy { getSharedPreferences("mirror_local", MODE_PRIVATE) }
@@ -84,8 +82,23 @@ class MainActivity : ComponentActivity() {
     }
     private val reviewRepository by lazy {
         ReviewManagerRepository(object : ReviewStringStore {
-            override fun read(): String? = prefs.getString(REVIEW_MANAGER_STORE, null)
+            override fun read(): String? = readPreferenceString(REVIEW_MANAGER_STORE)
             override fun write(value: String): Boolean = prefs.edit().putString(REVIEW_MANAGER_STORE, value).commit()
+            override fun preserve(value: String): Boolean = preserveRaw(REVIEW_RECOVERY_PREFIX, value)
+        })
+    }
+    private val datasetRepository by lazy {
+        DatasetRepository(object : DatasetStringStore {
+            override fun read(): String? = readPreferenceString(DATASET_STORE)
+            override fun write(value: String): Boolean = prefs.edit().putString(DATASET_STORE, value).remove("followers").remove("following").commit()
+            override fun preserve(value: String): Boolean = preserveRaw(DATASET_RECOVERY_PREFIX, value)
+        })
+    }
+    private val snapshotRepository by lazy {
+        SnapshotRepository(object : SnapshotStringStore {
+            override fun read(): String? = readPreferenceString("snapshots")
+            override fun write(value: String): Boolean = prefs.edit().putString("snapshots", value).commit()
+            override fun preserve(value: String): Boolean = preserveRaw(SNAPSHOT_RECOVERY_PREFIX, value)
         })
     }
     private var themeMode by mutableStateOf(ThemeMode.DARK)
@@ -99,12 +112,39 @@ class MainActivity : ComponentActivity() {
     private var reviewState by mutableStateOf(ReviewState())
     private var reviewStatusMessage by mutableStateOf("")
     private var statusMessage by mutableStateOf("Import your Instagram data export to begin.")
+    private var datasetRecovery by mutableStateOf<RecoveryNotice?>(null)
+    private var snapshotRecovery by mutableStateOf<RecoveryNotice?>(null)
+    private var reviewRecovery by mutableStateOf<RecoveryNotice?>(null)
+    private var pendingRecoveryReplacement by mutableStateOf<Pair<FollowerData.DatasetKind, SavedDataset>?>(null)
+    private var pendingRestore by mutableStateOf<Pair<RecoveryTarget, String>?>(null)
+    private var pendingDiscardTarget by mutableStateOf<RecoveryTarget?>(null)
+    private var exportRaw: String? = null
+    private var exportName: String = "follower-mirror-recovery.json"
+
+    private val recoveryExportLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        val raw = exportRaw
+        exportRaw = null
+        if (uri == null || raw == null) return@registerForActivityResult
+        runCatching {
+            contentResolver.openOutputStream(uri, "w")?.bufferedWriter()?.use { it.write(raw) }
+                ?: throw IllegalStateException("Could not open the selected destination.")
+        }.onSuccess { toast("Recovery copy exported. Your saved data was not changed.") }
+            .onFailure { toast("Could not export recovery data. Your saved data was not changed.") }
+    }
+    private val recoveryRestoreLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val target = restoreTarget ?: return@registerForActivityResult
+        runCatching { readDocument(uri) }
+            .onSuccess { pendingRestore = target to it }
+            .onFailure { toast("Could not read the selected recovery file. Saved data was not changed.") }
+    }
+    private var restoreTarget: RecoveryTarget? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         themeMode = themePreference.load()
-        snapshots = loadSnapshots()
-        reviewState = reviewRepository.load()
+        loadSnapshots()
+        loadReviewData()
         loadDatasets()
         setContent { FollowerMirrorTheme(themeMode) { MirrorApp() } }
     }
@@ -302,12 +342,25 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (destination == DashboardDestination.HISTORY) {
-                    HistoryScreen(snapshots = snapshots, onDelete = { snapshotToDelete = it })
+                    HistoryScreen(
+                        snapshots = snapshots,
+                        recovery = snapshotRecovery,
+                        onDelete = { snapshotToDelete = it },
+                        onExportRecovery = { snapshotRecovery?.raw?.let { exportRecovery(it, "follower-snapshots-recovery.json") } },
+                        onRestoreBackup = { launchRecoveryRestore(RecoveryTarget.SNAPSHOTS) },
+                        onDiscardRecovery = { pendingDiscardTarget = RecoveryTarget.SNAPSHOTS },
+                        onRetryLoad = ::loadSnapshots,
+                    )
                 } else if (destination == DashboardDestination.IMPORT_MANAGER) {
                     ImportManagerScreen(
                         followers = followerDataset,
                         following = followingDataset,
                         statusMessage = statusMessage,
+                        recovery = datasetRecovery,
+                        onExportRecovery = { datasetRecovery?.raw?.let { exportRecovery(it, "follower-datasets-recovery.json") } },
+                        onRestoreBackup = { launchRecoveryRestore(RecoveryTarget.DATASETS) },
+                        onDiscardRecovery = { pendingDiscardTarget = RecoveryTarget.DATASETS },
+                        onRetryLoad = ::loadDatasets,
                         onReplaceFollowers = { followerPicker.launch(arrayOf("application/json", "text/*", "application/octet-stream")) },
                         onReplaceFollowing = { followingPicker.launch(arrayOf("application/json", "text/*", "application/octet-stream")) },
                         onDeleteFollowers = { pendingDataAction = DataAction.DELETE_FOLLOWERS },
@@ -318,6 +371,11 @@ class MainActivity : ComponentActivity() {
                     ReviewManagerScreen(
                         state = reviewState,
                         statusMessage = reviewStatusMessage,
+                        recovery = reviewRecovery,
+                        onExportRecovery = { reviewRecovery?.raw?.let { exportRecovery(it, "follower-review-recovery.json") } },
+                        onRestoreBackup = { launchRecoveryRestore(RecoveryTarget.REVIEW) },
+                        onDiscardRecovery = { pendingDiscardTarget = RecoveryTarget.REVIEW },
+                        onRetryLoad = ::loadReviewData,
                         onOpenProfile = ::openProfile,
                         onChangeStatus = { usernames, status -> applyReviewResult(reviewRepository.changeStatus(reviewState, usernames, status, System.currentTimeMillis())) },
                         onConfirmManual = { usernames -> applyReviewResult(reviewRepository.confirmManualCompletion(reviewState, usernames, System.currentTimeMillis())) },
@@ -435,7 +493,9 @@ class MainActivity : ComponentActivity() {
                 val message = when (action) {
                     DataAction.DELETE_FOLLOWERS -> "This permanently removes only the imported Followers dataset. Your Following dataset and snapshots will remain."
                     DataAction.DELETE_FOLLOWING -> "This permanently removes only the imported Following dataset. Your Followers dataset and snapshots will remain."
-                    DataAction.RESET_ALL -> "This removes both imported datasets, saved follower snapshots, and Review Manager queue, protection, and history from this device. Theme and other app preferences are preserved. This cannot be undone."
+                    DataAction.RESET_ALL -> if (datasetRecovery != null || snapshotRecovery != null || reviewRecovery != null) {
+                        "This removes active datasets, snapshots, and Review Manager data. Any unreadable saved JSON will first be kept in a local recovery copy. Theme and other app preferences are preserved."
+                    } else "This removes both imported datasets, saved follower snapshots, and Review Manager queue, protection, and history from this device. Theme and other app preferences are preserved. This cannot be undone."
                 }
                 AlertDialog(
                     onDismissRequest = { pendingDataAction = null },
@@ -452,6 +512,41 @@ class MainActivity : ComponentActivity() {
                         }) { Text(if (action == DataAction.RESET_ALL) "RESET ALL" else "DELETE", color = colors.error) }
                     },
                     dismissButton = { TextButton(onClick = { pendingDataAction = null }) { Text("CANCEL") } },
+                )
+            }
+            pendingRecoveryReplacement?.let { (kind, dataset) ->
+                AlertDialog(
+                    onDismissRequest = { pendingRecoveryReplacement = null },
+                    title = { Text("Replace unreadable saved datasets?") },
+                    text = { Text("Both Followers and Following are stored together, and the saved copy cannot be read. Follower Mirror will preserve the original raw data in a local recovery copy, then replace it with this ${kind.name.lowercase(Locale.ROOT)} import. Restore a backup later to recover the other category.") },
+                    confirmButton = {
+                        TextButton(onClick = { replaceUnreadableDataset(kind, dataset); pendingRecoveryReplacement = null }) {
+                            Text("BACK UP & REPLACE", color = colors.primary)
+                        }
+                    },
+                    dismissButton = { TextButton(onClick = { pendingRecoveryReplacement = null }) { Text("CANCEL") } },
+                )
+            }
+            pendingRestore?.let { (target, raw) ->
+                AlertDialog(
+                    onDismissRequest = { pendingRestore = null },
+                    title = { Text("Restore saved ${target.label()}?") },
+                    text = { Text("The selected file will replace the active ${target.label()} data after validation. If the current copy is unreadable, Follower Mirror will first preserve it in a local recovery copy. Follower Mirror does not upload recovery files; choose a location you trust when exporting a copy.") },
+                    confirmButton = {
+                        TextButton(onClick = { restoreFromBackup(target, raw); pendingRestore = null }) { Text("RESTORE", color = colors.primary) }
+                    },
+                    dismissButton = { TextButton(onClick = { pendingRestore = null }) { Text("CANCEL") } },
+                )
+            }
+            pendingDiscardTarget?.let { target ->
+                AlertDialog(
+                    onDismissRequest = { pendingDiscardTarget = null },
+                    title = { Text("Discard unreadable ${target.label()}?") },
+                    text = { Text("This clears the unreadable active copy. Its original data will first be preserved in a local recovery copy. Export the original first if you want a separate file outside the app.") },
+                    confirmButton = {
+                        TextButton(onClick = { discardUnreadable(target); pendingDiscardTarget = null }) { Text("PRESERVE & CLEAR", color = colors.error) }
+                    },
+                    dismissButton = { TextButton(onClick = { pendingDiscardTarget = null }) { Text("CANCEL") } },
                 )
             }
         }
@@ -533,7 +628,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @Composable private fun HistoryScreen(snapshots: List<Snapshot>, onDelete: (Snapshot) -> Unit) {
+    @Composable private fun HistoryScreen(
+        snapshots: List<Snapshot>,
+        recovery: RecoveryNotice?,
+        onDelete: (Snapshot) -> Unit,
+        onExportRecovery: () -> Unit,
+        onRestoreBackup: () -> Unit,
+        onDiscardRecovery: () -> Unit,
+        onRetryLoad: () -> Unit,
+    ) {
         val colors = MaterialTheme.colorScheme
         Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 12.dp)) {
             Text(
@@ -541,9 +644,19 @@ class MainActivity : ComponentActivity() {
                 color = colors.onSurfaceVariant, fontSize = 12.sp, lineHeight = 18.sp,
             )
             Spacer(Modifier.height(12.dp))
+            recovery?.let { issue ->
+                RecoveryCard(
+                    issue = issue,
+                    onExport = onExportRecovery,
+                    onRestore = onRestoreBackup,
+                    onDiscard = onDiscardRecovery,
+                    onRetry = onRetryLoad,
+                )
+                Spacer(Modifier.height(10.dp))
+            }
             if (snapshots.isEmpty()) {
                 Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Text("No saved snapshots yet. Import followers and save a snapshot to start tracking.", color = colors.onSurfaceVariant)
+                    Text(if (recovery != null) "History is paused while saved snapshots are recovered." else "No saved snapshots yet. Import followers and save a snapshot to start tracking.", color = colors.onSurfaceVariant)
                 }
             } else {
                 LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -565,10 +678,38 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Composable private fun RecoveryCard(
+        issue: RecoveryNotice,
+        onExport: () -> Unit,
+        onRestore: () -> Unit,
+        onDiscard: () -> Unit,
+        onRetry: () -> Unit,
+        allowDiscard: Boolean = true,
+    ) {
+        val colors = MaterialTheme.colorScheme
+        Column(Modifier.fillMaxWidth().background(colors.errorContainer, RoundedCornerShape(10.dp)).padding(10.dp)) {
+            Text("RECOVERY REQUIRED", color = colors.onErrorContainer, fontWeight = FontWeight.Black, fontSize = 11.sp)
+            Spacer(Modifier.height(4.dp))
+            Text(issue.message, color = colors.onErrorContainer, fontSize = 11.sp, lineHeight = 15.sp)
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                if (issue.raw != null) {
+                    TextButton(onClick = onExport) { Text("EXPORT ORIGINAL", fontSize = 9.sp, maxLines = 1) }
+                    TextButton(onClick = onRestore) { Text("RESTORE BACKUP", fontSize = 9.sp, maxLines = 1) }
+                    if (allowDiscard) TextButton(onClick = onDiscard) { Text("PRESERVE & CLEAR", fontSize = 9.sp, maxLines = 1) }
+                } else TextButton(onClick = onRetry) { Text("RETRY", fontSize = 9.sp, maxLines = 1) }
+            }
+        }
+    }
+
     @Composable private fun ImportManagerScreen(
         followers: SavedDataset?,
         following: SavedDataset?,
         statusMessage: String,
+        recovery: RecoveryNotice?,
+        onExportRecovery: () -> Unit,
+        onRestoreBackup: () -> Unit,
+        onDiscardRecovery: () -> Unit,
+        onRetryLoad: () -> Unit,
         onReplaceFollowers: () -> Unit,
         onReplaceFollowing: () -> Unit,
         onDeleteFollowers: () -> Unit,
@@ -578,17 +719,21 @@ class MainActivity : ComponentActivity() {
         val colors = MaterialTheme.colorScheme
         Column(Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp)) {
             Text("Each dataset is managed independently. A replacement is checked before it is saved; a rejected import leaves the current dataset unchanged.", color = colors.onSurfaceVariant, fontSize = 12.sp, lineHeight = 18.sp)
+            recovery?.let { issue ->
+                Spacer(Modifier.height(8.dp))
+                RecoveryCard(issue, onExportRecovery, onRestoreBackup, onDiscard = onDiscardRecovery, onRetry = onRetryLoad)
+            }
             Spacer(Modifier.height(10.dp))
             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 item {
                     DatasetManagerCard(
-                        title = "Followers", dataset = followers,
+                        title = "Followers", dataset = followers, unreadable = recovery != null,
                         onReplace = onReplaceFollowers, onDelete = onDeleteFollowers,
                     )
                 }
                 item {
                     DatasetManagerCard(
-                        title = "Following", dataset = following,
+                        title = "Following", dataset = following, unreadable = recovery != null,
                         onReplace = onReplaceFollowing, onDelete = onDeleteFollowing,
                     )
                 }
@@ -608,6 +753,7 @@ class MainActivity : ComponentActivity() {
     @Composable private fun DatasetManagerCard(
         title: String,
         dataset: SavedDataset?,
+        unreadable: Boolean,
         onReplace: () -> Unit,
         onDelete: () -> Unit,
     ) {
@@ -617,6 +763,7 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(6.dp))
             Text(
                 when {
+                    unreadable -> "Status: Saved data could not be read; see recovery options above"
                     dataset == null -> "Status: No dataset imported"
                     dataset.validated -> "Status: Imported and validated"
                     else -> "Status: Older import; category was not validated. Replace to verify it."
@@ -625,8 +772,8 @@ class MainActivity : ComponentActivity() {
                 fontSize = 11.sp,
                 lineHeight = 16.sp,
             )
-            Text("Unique accounts: ${dataset?.accounts?.size ?: 0}", color = colors.onSurface, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
-            Text("Imported: ${dataset?.importedAt?.toDateLabel() ?: if (dataset == null) "—" else "Date unavailable (older import)"}", color = colors.onSurfaceVariant, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp))
+            Text("Unique accounts: ${if (unreadable) "—" else dataset?.accounts?.size ?: 0}", color = colors.onSurface, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+            Text("Imported: ${if (unreadable) "Unavailable until recovered" else dataset?.importedAt?.toDateLabel() ?: if (dataset == null) "—" else "Date unavailable (older import)"}", color = colors.onSurfaceVariant, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp))
             val sources = dataset?.sourceFiles?.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: if (dataset == null) "—" else "Filename unavailable (older import)"
             Text("Source: $sources", color = colors.onSurfaceVariant, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
             Spacer(Modifier.height(10.dp))
@@ -634,8 +781,8 @@ class MainActivity : ComponentActivity() {
                 Button(onClick = onReplace, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = colors.primary, contentColor = colors.onPrimary), shape = RoundedCornerShape(8.dp)) {
                     Text("REPLACE DATASET", fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 }
-                OutlinedButton(onClick = onDelete, enabled = dataset != null, modifier = Modifier.weight(1f), shape = RoundedCornerShape(8.dp)) {
-                    Text("DELETE DATASET", fontSize = 10.sp, color = if (dataset != null) colors.onSurface else colors.onSurfaceVariant)
+                OutlinedButton(onClick = onDelete, enabled = dataset != null && !unreadable, modifier = Modifier.weight(1f), shape = RoundedCornerShape(8.dp)) {
+                    Text("DELETE DATASET", fontSize = 10.sp, color = if (dataset != null && !unreadable) colors.onSurface else colors.onSurfaceVariant)
                 }
             }
         }
@@ -713,11 +860,12 @@ class MainActivity : ComponentActivity() {
             val documents = uris.map { uri -> FollowerData.SourceDocument(documentName(uri), readDocument(uri)) }
             val validated = FollowerData.validateAndParse(documents, FollowerData.DatasetKind.FOLLOWERS)
             val replacement = SavedDataset(validated.accounts, System.currentTimeMillis(), validated.sourceFiles, validated = true)
-            if (!persistDatasets(replacement, followingDataset)) {
-                throw IllegalStateException("Could not save the replacement. Your previous Followers dataset is unchanged.")
+            if (datasetRecovery != null) {
+                pendingRecoveryReplacement = FollowerData.DatasetKind.FOLLOWERS to replacement
+                return
             }
-            statusMessage = "Imported ${replacement.accounts.size} unique Followers from ${replacement.sourceFiles.size} file(s)."
-            toast(statusMessage)
+            val result = datasetRepository.replaceFollowers(replacement)
+            applyDatasetWrite(result.copy(message = if (result.success) "Imported ${replacement.accounts.size} unique Followers from ${replacement.sourceFiles.size} file(s)." else result.message))
         } catch (e: Exception) {
             statusMessage = "Import failed: ${e.message ?: "invalid file"}"
             toast(statusMessage)
@@ -732,11 +880,12 @@ class MainActivity : ComponentActivity() {
                 FollowerData.DatasetKind.FOLLOWING,
             )
             val replacement = SavedDataset(validated.accounts, System.currentTimeMillis(), validated.sourceFiles, validated = true)
-            if (!persistDatasets(followerDataset, replacement)) {
-                throw IllegalStateException("Could not save the replacement. Your previous Following dataset is unchanged.")
+            if (datasetRecovery != null) {
+                pendingRecoveryReplacement = FollowerData.DatasetKind.FOLLOWING to replacement
+                return
             }
-            statusMessage = "Imported ${replacement.accounts.size} unique Following accounts."
-            toast(statusMessage)
+            val result = datasetRepository.replaceFollowing(replacement)
+            applyDatasetWrite(result.copy(message = if (result.success) "Imported ${replacement.accounts.size} unique Following accounts." else result.message))
         } catch (e: Exception) {
             statusMessage = "Import failed: ${e.message ?: "invalid file"}"
             toast(statusMessage)
@@ -758,91 +907,148 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadDatasets() {
-        val stored = prefs.getString(DATASET_STORE, null)
-        if (stored != null) {
-            try {
-                val root = JSONObject(stored)
-                followerDataset = readDataset(root.opt("followers"))
-                followingDataset = readDataset(root.opt("following"))
-            } catch (_: Exception) {
-                statusMessage = "Saved imports could not be read. Replace them using valid Instagram export files."
+        when (val result = datasetRepository.load()) {
+            DatasetLoadResult.Missing -> { datasetRecovery = null; loadLegacyDatasets() }
+            is DatasetLoadResult.Loaded -> {
+                datasetRecovery = null
+                followerDataset = result.bundle.followers
+                followingDataset = result.bundle.following
+                if (statusMessage.startsWith("Saved") || statusMessage.startsWith("Could not")) statusMessage = "Saved imports loaded."
             }
+            is DatasetLoadResult.RecoveryRequired -> {
+                datasetRecovery = RecoveryNotice(result.raw, result.reason)
+                followerDataset = null
+                followingDataset = null
+                statusMessage = result.reason
+            }
+            is DatasetLoadResult.Unavailable -> {
+                datasetRecovery = RecoveryNotice(null, result.reason)
+                followerDataset = null
+                followingDataset = null
+                statusMessage = result.reason
+            }
+        }
+    }
+
+    private fun loadLegacyDatasets() {
+        val followersRead = runCatching { readPreferenceString("followers") }
+        val followingRead = runCatching { readPreferenceString("following") }
+        if (followersRead.isFailure || followingRead.isFailure) {
+            val followersRaw = followersRead.getOrNull() ?: followersRead.exceptionOrNull().recoveryRepresentation()
+            val followingRaw = followingRead.getOrNull() ?: followingRead.exceptionOrNull().recoveryRepresentation()
+            val raw = if (followersRaw == null && followingRaw == null) null else legacyBackupDocument(followersRaw, followingRaw)
+            val issue = datasetRepository.markUnreadable(raw)
+            datasetRecovery = RecoveryNotice(issue.raw.takeIf(String::isNotEmpty), issue.reason)
+            statusMessage = issue.reason
             return
         }
+        val legacyFollowersRaw = followersRead.getOrNull()
+        val legacyFollowingRaw = followingRead.getOrNull()
+        if (legacyFollowersRaw == null && legacyFollowingRaw == null) return
+        try {
+            val legacyFollowers = legacyFollowersRaw?.let(::legacyDataset)
+            val legacyFollowing = legacyFollowingRaw?.let(::legacyDataset)
+            val result = datasetRepository.replaceAfterRecovery(DatasetBundle(legacyFollowers, legacyFollowing))
+            if (result.success) {
+                followerDataset = result.bundle.followers
+                followingDataset = result.bundle.following
+                statusMessage = "Older imports loaded; their source and type were not recorded. Replace them to validate."
+            } else {
+                datasetRecovery = datasetRepository.markUnreadable(legacyBackupDocument(legacyFollowersRaw, legacyFollowingRaw)).let { RecoveryNotice(it.raw.takeIf(String::isNotEmpty), it.reason) }
+                statusMessage = datasetRecovery?.message.orEmpty()
+            }
+        } catch (_: Exception) {
+            val backup = legacyBackupDocument(legacyFollowersRaw, legacyFollowingRaw)
+            val issue = datasetRepository.markUnreadable(backup)
+            datasetRecovery = RecoveryNotice(issue.raw, issue.reason)
+            statusMessage = issue.reason
+        }
+    }
 
-        // One-time migration of datasets saved by earlier app builds. Their original source and type
-        // were not recorded, so mark them unverified and ask the user to replace them to validate.
-        val legacyFollowers = prefs.getString("followers", null)?.let { legacyDataset(it) }
-        val legacyFollowing = prefs.getString("following", null)?.let { legacyDataset(it) }
-        if (legacyFollowers != null || legacyFollowing != null) {
-            if (!persistDatasets(legacyFollowers, legacyFollowing)) {
-                followerDataset = legacyFollowers
-                followingDataset = legacyFollowing
-                statusMessage = "Older imports loaded; their file type was not recorded. Replace them to validate."
+    private fun legacyDataset(serializedAccounts: String): SavedDataset {
+        val array = JSONArray(serializedAccounts)
+        val names = buildSet {
+            for (index in 0 until array.length()) {
+                val value = array.opt(index) as? String ?: throw IllegalArgumentException("An older saved account record is invalid.")
+                val normalized = value.trim().removePrefix("@").lowercase(Locale.ROOT)
+                if (!normalized.matches(Regex("[a-z0-9._]{1,30}"))) throw IllegalArgumentException("An older saved account record is incomplete.")
+                add(normalized)
             }
         }
+        return SavedDataset(names, null, emptyList(), validated = false)
     }
 
-    private fun legacyDataset(serializedAccounts: String): SavedDataset = SavedDataset(
-        accounts = FollowerData.normalizeUsernames(jsonArrayToSet(JSONArray(serializedAccounts))),
-        importedAt = null,
-        sourceFiles = emptyList(),
-        validated = false,
-    )
+    private fun legacyBackupDocument(followers: String?, following: String?) = JSONObject()
+        .put("legacyFollowersRaw", followers ?: JSONObject.NULL)
+        .put("legacyFollowingRaw", following ?: JSONObject.NULL)
+        .toString()
 
-    private fun readDataset(value: Any?): SavedDataset? {
-        if (value == null || value == JSONObject.NULL) return null
-        val item = value as? JSONObject ?: throw IllegalArgumentException("Invalid saved dataset")
-        return SavedDataset(
-            accounts = FollowerData.normalizeUsernames(jsonArrayToSet(item.getJSONArray("accounts"))),
-            importedAt = item.optLong("importedAt").takeIf { it > 0L },
-            sourceFiles = item.optJSONArray("sourceFiles")?.let(::jsonArrayToSetList).orEmpty(),
-            validated = item.optBoolean("validated", false),
-        )
-    }
+    private fun Throwable?.recoveryRepresentation(): String? = (this as? UnreadableStoredValue)?.recoveryCopy
 
-    /** Persist both categories in one preference value; update Compose state only after commit succeeds. */
-    private fun persistDatasets(newFollowers: SavedDataset?, newFollowing: SavedDataset?): Boolean {
-        val root = JSONObject()
-            .put("followers", datasetJson(newFollowers))
-            .put("following", datasetJson(newFollowing))
-        val committed = prefs.edit()
-            .putString(DATASET_STORE, root.toString())
-            .remove("followers")
-            .remove("following")
-            .commit()
-        if (committed) {
-            followerDataset = newFollowers
-            followingDataset = newFollowing
+    private fun readPreferenceString(key: String): String? = try {
+        prefs.getString(key, null)
+    } catch (_: ClassCastException) {
+        val stored = prefs.all[key]
+        val value = when (stored) {
+            null -> JSONObject.NULL
+            is String, is Number, is Boolean -> stored
+            is Set<*> -> JSONArray(stored.map { it?.toString() ?: "" })
+            else -> stored.toString()
         }
-        return committed
+        val recoveryCopy = JSONObject()
+            .put("incompatiblePreferenceValueType", stored?.javaClass?.name ?: "null")
+            .put("storedValue", value)
+            .toString()
+        throw UnreadableStoredValue(recoveryCopy, "Saved data uses an incompatible local storage type. The original preference value is preserved until you resolve it.")
     }
 
-    private fun datasetJson(dataset: SavedDataset?): Any = dataset?.let {
-        JSONObject()
-            .put("accounts", JSONArray(it.accounts.sorted()))
-            .put("importedAt", it.importedAt ?: JSONObject.NULL)
-            .put("sourceFiles", JSONArray(it.sourceFiles))
-            .put("validated", it.validated)
-    } ?: JSONObject.NULL
+    private fun applyDatasetWrite(result: DatasetWriteResult) {
+        if (result.success) {
+            followerDataset = result.bundle.followers
+            followingDataset = result.bundle.following
+            datasetRecovery = null
+        }
+        statusMessage = result.message
+        toast(result.message)
+    }
+
+    private fun replaceUnreadableDataset(kind: FollowerData.DatasetKind, dataset: SavedDataset) {
+        val bundle = when (kind) {
+            FollowerData.DatasetKind.FOLLOWERS -> DatasetBundle(dataset, null)
+            FollowerData.DatasetKind.FOLLOWING -> DatasetBundle(null, dataset)
+            else -> return
+        }
+        applyDatasetWrite(datasetRepository.replaceAfterRecovery(bundle))
+    }
 
     private fun deleteDataset(kind: FollowerData.DatasetKind) {
-        val success = when (kind) {
-            FollowerData.DatasetKind.FOLLOWERS -> persistDatasets(null, followingDataset)
-            FollowerData.DatasetKind.FOLLOWING -> persistDatasets(followerDataset, null)
-            else -> false
+        val result = when (kind) {
+            FollowerData.DatasetKind.FOLLOWERS -> datasetRepository.deleteFollowers()
+            FollowerData.DatasetKind.FOLLOWING -> datasetRepository.deleteFollowing()
+            else -> return
         }
-        statusMessage = if (success) {
+        applyDatasetWrite(result.copy(message = if (result.success) {
             if (kind == FollowerData.DatasetKind.FOLLOWERS) "Followers dataset deleted; Following was kept." else "Following dataset deleted; Followers was kept."
-        } else "Delete failed. Your saved datasets were kept."
-        toast(statusMessage)
+        } else result.message))
     }
 
     private fun resetAllData() {
-        val emptyStore = JSONObject()
-            .put("followers", JSONObject.NULL)
-            .put("following", JSONObject.NULL)
-            .toString()
+        val unreadable = listOfNotNull(
+            datasetRecovery?.let { DATASET_RECOVERY_PREFIX to it.raw },
+            snapshotRecovery?.let { SNAPSHOT_RECOVERY_PREFIX to it.raw },
+            reviewRecovery?.let { REVIEW_RECOVERY_PREFIX to it.raw },
+        )
+        if (unreadable.any { it.second == null }) {
+            statusMessage = "Reset paused because unreadable data could not be copied for recovery. Retry after reopening the app."
+            toast(statusMessage)
+            return
+        }
+        if (unreadable.any { (prefix, raw) -> raw != null && !preserveRaw(prefix, raw) }) {
+            statusMessage = "Reset paused because a local recovery copy could not be saved. Your data is unchanged."
+            toast(statusMessage)
+            return
+        }
+        val emptyStore = DatasetJsonCodec.encode(DatasetBundle(null, null))
         val success = prefs.edit()
             .putString(DATASET_STORE, emptyStore)
             .remove("followers")
@@ -855,6 +1061,12 @@ class MainActivity : ComponentActivity() {
             followingDataset = null
             snapshots = emptyList()
             reviewState = ReviewState()
+            datasetRecovery = null
+            snapshotRecovery = null
+            reviewRecovery = null
+            loadDatasets()
+            loadSnapshots()
+            loadReviewData()
             reviewStatusMessage = "Review queue and history were cleared."
             statusMessage = "Imported datasets, follower snapshots, and Review Manager data were cleared. Other app preferences were preserved."
         } else {
@@ -863,41 +1075,59 @@ class MainActivity : ComponentActivity() {
         toast(statusMessage)
     }
 
-    private fun jsonArrayToSetList(array: JSONArray): List<String> =
-        (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }
-
-    private data class Snapshot(val date: Long, val followers: Set<String>)
-
     private fun saveSnapshot() {
+        if (snapshotRecovery != null) {
+            toast("Snapshot changes are paused. Export or restore the saved history first.")
+            return
+        }
         if (!followersLoaded) { toast("Import followers before saving a snapshot."); return }
         val current = Snapshot(System.currentTimeMillis(), followers)
-        snapshots = (listOf(current) + snapshots).take(30)
-        persistSnapshots()
+        val result = snapshotRepository.write((listOf(current) + snapshots).take(30))
+        if (!result.success) { toast(result.message); return }
+        snapshots = result.snapshots
         statusMessage = "Snapshot saved: ${followers.size} followers. Import a newer list later to compare exports."
         toast("Follower snapshot saved locally.")
     }
 
     private fun deleteSnapshot(date: Long) {
-        snapshots = snapshots.filterNot { it.date == date }
-        persistSnapshots()
-        toast("Snapshot deleted.")
+        val result = snapshotRepository.write(snapshots.filterNot { it.date == date })
+        if (result.success) snapshots = result.snapshots
+        toast(if (result.success) "Snapshot deleted." else result.message)
     }
 
-    private fun persistSnapshots() {
-        val array = JSONArray()
-        snapshots.forEach { snapshot ->
-            array.put(JSONObject().put("date", snapshot.date).put("followers", JSONArray(snapshot.followers.sorted())))
+    private fun loadSnapshots() {
+        when (val result = snapshotRepository.load()) {
+            SnapshotLoadResult.Missing -> { snapshots = emptyList(); snapshotRecovery = null }
+            is SnapshotLoadResult.Loaded -> { snapshots = result.snapshots; snapshotRecovery = null }
+            is SnapshotLoadResult.RecoveryRequired -> {
+                snapshots = emptyList()
+                snapshotRecovery = RecoveryNotice(result.raw, result.reason)
+                statusMessage = result.reason
+            }
+            is SnapshotLoadResult.Unavailable -> {
+                snapshots = emptyList()
+                snapshotRecovery = RecoveryNotice(null, result.reason)
+                statusMessage = result.reason
+            }
         }
-        prefs.edit().putString("snapshots", array.toString()).apply()
     }
 
-    private fun loadSnapshots(): List<Snapshot> = try {
-        val array = JSONArray(prefs.getString("snapshots", "[]"))
-        (0 until array.length()).map { index ->
-            val item = array.getJSONObject(index)
-            Snapshot(item.getLong("date"), FollowerData.normalizeUsernames(jsonArrayToSet(item.getJSONArray("followers"))))
-        }.sortedByDescending { it.date }
-    } catch (_: Exception) { emptyList() }
+    private fun loadReviewData() {
+        when (val result = reviewRepository.load()) {
+            ReviewLoadResult.Missing -> { reviewState = ReviewState(); reviewRecovery = null }
+            is ReviewLoadResult.Loaded -> { reviewState = result.state; reviewRecovery = null }
+            is ReviewLoadResult.RecoveryRequired -> {
+                reviewState = ReviewState()
+                reviewRecovery = RecoveryNotice(result.raw, result.reason)
+                statusMessage = result.reason
+            }
+            is ReviewLoadResult.Unavailable -> {
+                reviewState = ReviewState()
+                reviewRecovery = RecoveryNotice(null, result.reason)
+                statusMessage = result.reason
+            }
+        }
+    }
 
     private fun openProfile(username: String) {
         try {
@@ -909,6 +1139,81 @@ class MainActivity : ComponentActivity() {
         if (result.success) reviewState = result.state
         reviewStatusMessage = result.message
         toast(result.message)
+    }
+
+    private fun preserveRaw(prefix: String, raw: String): Boolean {
+        val base = "$prefix${System.currentTimeMillis()}"
+        var key = base
+        var suffix = 0
+        while (prefs.contains(key)) key = "$base-${++suffix}"
+        return prefs.edit().putString(key, raw).commit()
+    }
+
+    private fun exportRecovery(raw: String, suggestedName: String) {
+        exportRaw = raw
+        exportName = suggestedName
+        recoveryExportLauncher.launch(suggestedName)
+    }
+
+    private fun launchRecoveryRestore(target: RecoveryTarget) {
+        restoreTarget = target
+        recoveryRestoreLauncher.launch(arrayOf("application/json", "text/*", "application/octet-stream"))
+    }
+
+    private fun restoreFromBackup(target: RecoveryTarget, raw: String) {
+        when (target) {
+            RecoveryTarget.DATASETS -> {
+                val result = datasetRepository.restore(raw)
+                if (result.success) {
+                    followerDataset = result.bundle.followers
+                    followingDataset = result.bundle.following
+                    datasetRecovery = null
+                }
+                statusMessage = result.message
+                toast(result.message)
+            }
+            RecoveryTarget.SNAPSHOTS -> {
+                val result = snapshotRepository.restore(raw)
+                if (result.success) { snapshots = result.snapshots; snapshotRecovery = null }
+                toast(result.message)
+            }
+            RecoveryTarget.REVIEW -> {
+                val result = reviewRepository.restore(raw)
+                if (result.success) { reviewState = result.state; reviewRecovery = null }
+                applyReviewResult(result)
+            }
+        }
+    }
+
+    private fun discardUnreadable(target: RecoveryTarget) {
+        when (target) {
+            RecoveryTarget.DATASETS -> {
+                val result = datasetRepository.reset()
+                if (result.success) {
+                    followerDataset = null
+                    followingDataset = null
+                    datasetRecovery = null
+                }
+                statusMessage = result.message
+                toast(result.message)
+            }
+            RecoveryTarget.SNAPSHOTS -> {
+                val result = snapshotRepository.discard()
+                if (result.success) { snapshots = result.snapshots; snapshotRecovery = null }
+                toast(result.message)
+            }
+            RecoveryTarget.REVIEW -> {
+                val result = reviewRepository.discardUnreadable()
+                if (result.success) { reviewState = result.state; reviewRecovery = null }
+                applyReviewResult(result)
+            }
+        }
+    }
+
+    private fun RecoveryTarget.label(): String = when (this) {
+        RecoveryTarget.DATASETS -> "Followers and Following"
+        RecoveryTarget.SNAPSHOTS -> "snapshots"
+        RecoveryTarget.REVIEW -> "Review Manager"
     }
 
     private fun updateThemeMode(mode: ThemeMode) {
@@ -932,8 +1237,6 @@ class MainActivity : ComponentActivity() {
 
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     private fun setToJson(set: Set<String>) = JSONArray(set.sorted()).toString()
-    private fun jsonArrayToSet(array: JSONArray): Set<String> =
-        (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.toSet()
 }
 
 private fun Long.toDateLabel(): String =

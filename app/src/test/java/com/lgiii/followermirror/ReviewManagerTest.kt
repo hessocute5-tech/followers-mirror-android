@@ -8,11 +8,19 @@ import org.junit.Test
 class ReviewManagerTest {
     private class MemoryStore : ReviewStringStore {
         var value: String? = null
+        var preserved: String? = null
         var failWrites = false
-        override fun read(): String? = value
+        var failPreserve = false
+        var readFailure: Exception? = null
+        override fun read(): String? { readFailure?.let { throw it }; return value }
         override fun write(value: String): Boolean {
             if (failWrites) return false
             this.value = value
+            return true
+        }
+        override fun preserve(value: String): Boolean {
+            if (failPreserve) return false
+            preserved = value
             return true
         }
     }
@@ -89,7 +97,7 @@ class ReviewManagerTest {
         // Replacing the dataset preference leaves the dedicated review preference intact.
         preferences["imported_datasets_v1"] = "replacement"
         store.value = preferences.getValue("review_manager_v1")
-        val loaded = ReviewManagerRepository(store).load()
+        val loaded = (ReviewManagerRepository(store).load() as ReviewLoadResult.Loaded).state
 
         assertEquals("Check this later", loaded.queue.getValue("keep.me").notes)
         assertEquals(setOf("safeaccount"), loaded.protected)
@@ -119,5 +127,75 @@ class ReviewManagerTest {
         val result = repository.addToQueue(ReviewState(), listOf("valid", "not a username"), 1)
         assertFalse(result.success)
         assertTrue(result.state.queue.isEmpty())
+    }
+
+    @Test fun malformedReviewJsonBlocksWritesAndLeavesOriginalBytesUntouched() {
+        val raw = "{not valid JSON"
+        store.value = raw
+        val reloaded = ReviewManagerRepository(store)
+        assertTrue(reloaded.load() is ReviewLoadResult.RecoveryRequired)
+
+        val attemptedWrite = reloaded.addToQueue(ReviewState(), listOf("new.account"), 5)
+
+        assertFalse(attemptedWrite.success)
+        assertEquals(raw, store.value)
+    }
+
+    @Test fun missingRequiredReviewFieldsAndIncompleteRecordsAreRejected() {
+        val badDocuments = listOf(
+            "{}",
+            """{"version":1,"queue":[{}],"protected":[],"history":[]}""",
+            """{"version":1,"queue":[{"username":""}],"protected":[],"history":[]}""",
+            """{"version":1,"queue":[],"protected":"not-an-array","history":[]}""",
+        )
+        badDocuments.forEach { raw ->
+            store.value = raw
+            assertTrue(ReviewManagerRepository(store).load() is ReviewLoadResult.RecoveryRequired)
+            assertEquals("Unreadable document must stay byte-for-byte intact", raw, store.value)
+        }
+    }
+
+    @Test fun unsupportedReviewSchemaVersionIsNotTreatedAsEmpty() {
+        store.value = """{"version":2,"queue":[],"protected":[],"history":[]}"""
+        assertTrue(ReviewManagerRepository(store).load() is ReviewLoadResult.RecoveryRequired)
+        assertEquals(2, org.json.JSONObject(store.value!!).getInt("version"))
+    }
+
+    @Test fun validRestoredReviewDocumentIsBackedUpThenRecovered() {
+        val valid = repository.addToQueue(ReviewState(), listOf("restored.user"), 100).let { store.value!! }
+        val corrupt = "[partial saved review data"
+        store.value = corrupt
+        val recoveredRepository = ReviewManagerRepository(store)
+        assertTrue(recoveredRepository.load() is ReviewLoadResult.RecoveryRequired)
+
+        val restored = recoveredRepository.restore(valid)
+
+        assertTrue(restored.success)
+        assertEquals(corrupt, store.preserved)
+        assertEquals(setOf("restored.user"), restored.state.queue.keys)
+        assertEquals(restored.state, (recoveredRepository.load() as ReviewLoadResult.Loaded).state)
+    }
+
+    @Test fun failedRecoveryBackupOrWriteNeverReplacesTheUnreadableReviewDocument() {
+        val corrupt = "{broken"
+        store.value = corrupt
+        val recoveredRepository = ReviewManagerRepository(store)
+        recoveredRepository.load()
+        store.failPreserve = true
+        assertFalse(recoveredRepository.restore("""{"version":1,"queue":[],"protected":[],"history":[]}""").success)
+        assertEquals(corrupt, store.value)
+    }
+
+    @Test fun originalV1ReviewDocumentsWithoutVersionStillLoad() {
+        store.value = """{"queue":[],"protected":[],"history":[]}"""
+        assertEquals(ReviewState(), (ReviewManagerRepository(store).load() as ReviewLoadResult.Loaded).state)
+    }
+
+    @Test fun unreadablePreferenceValueIsNotConvertedIntoAnEmptyWritableQueue() {
+        val opaqueValue = "{\"storedValue\":\"preserve me\"}"
+        store.readFailure = UnreadableStoredValue(opaqueValue, "Incompatible preference value")
+        assertTrue(repository.load() is ReviewLoadResult.RecoveryRequired)
+        assertFalse(repository.addToQueue(ReviewState(), listOf("unsafe.overwrite"), 1).success)
+        assertEquals(null, store.value)
     }
 }
